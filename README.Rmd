@@ -163,7 +163,7 @@ simulation_dataset<-left_join(ipums_uhero, median_income, by = "UHERO_mnemonic")
                                 is.na(UHERO_mnemonic) | inc_wage == 0 ~ "unassigned"))
 
 # Create a table summarizing the UHERO forecasted job categories, number of wage earners per category, and number of forecasted job losses
-simulation_dataset %>% 
+job_summary_tbl<-simulation_dataset %>% 
   left_join(select(n_jobs, revised_losses, UHERO_mnemonic), by = "UHERO_mnemonic") %>% 
   select(unique_id, hhid, inc_wage, hh_income, revised_losses, Industry_Sector, UHERO_mnemonic) %>% 
   filter(!is.na(Industry_Sector)) %>% 
@@ -175,9 +175,10 @@ simulation_dataset %>%
   gt() %>%
   fmt_number(columns = vars("Number of Wage Earners", "Annual Job Losses (as of 2020 Q3)"), decimal = 0)
 
+gtsave(job_summary_tbl, filename = "job_summary_tbl.png")
+
 # Clean up variables tables prior to running simulation
 rm(ipums_raw, ipums_2018, ipums_uhero, uhero_forecast, uhero_jobs, uhero_job_losses, uhero_job_loss_reshape)
-gc()
 
 ```
 
@@ -331,7 +332,7 @@ The results of the analysis are presented in the graphs and tables below:
 
 ```{r results-support-needed}
 # Calculate the average 6 month needed support for affected households
-total_affected_rental_support %>%
+total_renter_support<-total_affected_rental_support %>%
   group_by(scenario) %>%
   summarize("Individual Household Support" = mean(AvgHHSupport*6),
             "Total Support" = mean(TotalHHSupport*6)) %>%
@@ -339,6 +340,8 @@ total_affected_rental_support %>%
   fmt_number(columns = vars("Individual Household Support", "Total Support"), decimal = 0) %>%
   tab_header(title = "Support Needed for Renter Households who Suffered a Job Loss",
              subtitle = "Mean of 100 simulations")
+
+gtsave(total_renter_support, filename = "total_renter_support.png")
 ```
 
 ### Summary of Rental Burden Changes
@@ -388,12 +391,14 @@ total_bucket_change %>%
   theme_minimal() +
   coord_flip()
 
-total_bucket_change %>%
+rental_bucket_change<-total_bucket_change %>%
   select(-burden_change) %>%
   gt() %>%
   cols_label(bucket_labels = "Rental Burden Group",
              avg_bucket_count = "Number of Households") %>%
   fmt_number(columns = vars(avg_bucket_count), decimal = 0)
+
+gtsave(rental_bucket_change, filename = "rental_bucket_change.png")
 
 ```
 
@@ -482,7 +487,7 @@ bin_join %>%
   scale_fill_manual(values = alpha(c("blue4", "lightblue"), 0.7), labels = c("Initial Count", "Avg Simulation Count")) +
   theme(legend.position = "bottom")
 
-bin_join %>%
+risk_bin_count<-bin_join %>%
   mutate(scenario_chr = paste0("scenario", scenario)) %>%
   select(scenario_chr, bin_label, initial_bin_count, sim_bin_count) %>% 
   spread(key = scenario_chr, value = sim_bin_count) %>%
@@ -494,5 +499,7 @@ bin_join %>%
              scenario3 = "Scenario 3",
              scenario4 = "Scenario 4") %>%
   fmt_number(columns = 2:6, decimal = 0)
+
+gtsave(risk_bin_count, filename = "risk_bin_count.png")
   
 ```
