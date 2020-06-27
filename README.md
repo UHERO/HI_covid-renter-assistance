@@ -3,8 +3,8 @@ Covid-19 Hawai’i Rental Assistance
 Isabelle Picciotto
 
 The following analysis of the burden renters will face in HI for the
-remainder of 2020 is presented in [this UHERO blog
-post](https://uhero.hawaii.edu/?p=8990).
+remainder of 2020 is presented in this UHERO blog post: [Estimating the
+Need for Rental Assistance in Hawaii](https://uhero.hawaii.edu/?p=8990).
 
 ``` r
 # Install required packages
@@ -14,8 +14,8 @@ post](https://uhero.hawaii.edu/?p=8990).
 #   "tidyverse",
 #   "lubridate",
 #   "scales",
-#   "svMIsc",
-#   "gt"
+#   "gt",
+#   "furrr"
 # )
 # 
 # install.packages(pkgs)
@@ -26,10 +26,12 @@ library(rmarkdown)
 library(tidyverse)
 library(lubridate)
 library(scales)
-library(svMisc)
 library(gt)
+library(furrr)
 
 options(scipen = 999)
+
+plan(multiprocess)
 ```
 
 ### Data Sources
@@ -149,18 +151,14 @@ n_jobs<-ipums_uhero %>%
   mutate(n_low = round(revised_losses*0.65),
          n_high = round(revised_losses*0.35))
 
-# Calculate the median individual income for each industry
-median_income<-ipums_uhero %>%
-  group_by(UHERO_mnemonic) %>%
-  summarize(median_income = median(inc_total, na.rm = T)) %>%
-  na.omit()
-
 # Add a median income column to the individual level data to determine whether each individual falls into the low/high income category
 # Exclude all individuals wtih wage income equal to zero so that they cannot randomly be assigned a job loss
-simulation_dataset<-left_join(ipums_uhero, median_income, by = "UHERO_mnemonic") %>%
-  mutate(income_cat = case_when(inc_total < median_income & inc_wage != 0 ~ "low",
-                                inc_total >= median_income & inc_wage != 0 ~ "high",
-                                is.na(UHERO_mnemonic) | inc_wage == 0 ~ "unassigned"))
+simulation_dataset<-ipums_uhero %>%
+  group_by(UHERO_mnemonic) %>%
+  mutate(income_cat = case_when(inc_total < median(inc_total) & inc_wage != 0 ~ "low",
+                                inc_total >= median(inc_total) & inc_wage != 0 ~ "high",
+                                is.na(UHERO_mnemonic) | inc_wage == 0 ~ "unassigned")) %>%
+  ungroup()
 
 # Create a table summarizing the UHERO forecasted job categories, number of wage earners per category, and number of forecasted job losses
 job_summary_tbl<-simulation_dataset %>% 
@@ -210,133 +208,132 @@ Four different policy scenarios are analyzed, each scenario is repeated
 <!-- end list -->
 
 ``` r
-scenarios<-1:4
-
-# Create empty dataframes for various simulation results
-total_sim_cdf<-tibble()
-total_burden_change<-tibble()
-loss_assignment<-tibble()
-total_affected_rental_support<-tibble()
-
-# Loop over each scenario, 1 - 4, repeat 100 times
-for (scenario in scenarios){
+simulation_scenario<-function(iteration, s, .job_loss_data, .ipums_data) {
   
-  # Assign Unemployment assistance for the current scenario
-  add_UI<-if_else(scenario == 1, 0, if_else(scenario == 2, 400, if_else(scenario == 3, 800, if(scenario == 4) 1200)))
+  n_iter<-iteration
   
-  for (i in 1:n_iterations){
-    progress(i)
-    
-    ### Low income:
-      # Generate the sampled/unsampled individuals and randomly assign job losses
-    sampled_low<-simulation_dataset %>%
-      filter(income_cat == "low") %>%
-      group_by(UHERO_mnemonic) %>%
-      nest() %>%
-      filter(!is.na(UHERO_mnemonic)) %>%
-      ungroup() %>%
-      left_join(select(n_jobs, UHERO_mnemonic, n_low), by = "UHERO_mnemonic") %>%
-      mutate(samp = map2(data, n_low, sample_n)) %>%
-      select(-data) %>%
-      unnest(samp) %>%
-      mutate(inc_wage_new = pmin(inc_wage*0.60, 648*52) + add_UI*12,
-             inc_total_new = (inc_total - inc_wage) + inc_wage_new,
-             affected = 1) %>%
-      select(-n_low)
-    
-    unsampled_low<-simulation_dataset %>%
-      filter(income_cat == "low") %>%
-      filter(!(unique_id %in% sampled_low$unique_id)) %>%
-      mutate(inc_wage_new = inc_total,
-             inc_total_new = inc_total,
-             affected = 0)
-    
-    ### High Income
-      # Generate the sampled/unsampled individuals and randomly assign job losses
-    sampled_high<-simulation_dataset %>%
-      filter(income_cat == "high") %>%
-      group_by(UHERO_mnemonic) %>%
-      nest() %>%
-      filter(!is.na(UHERO_mnemonic)) %>%
-      ungroup() %>%
-      left_join(select(n_jobs, UHERO_mnemonic, n_high), by = "UHERO_mnemonic") %>%
-      mutate(samp = map2(data, n_high, sample_n)) %>%
-      select(-data) %>%
-      unnest(samp) %>%
-      mutate(inc_wage_new = pmin(inc_wage*0.60, 648*52) + add_UI*12,
-             inc_total_new = (inc_total - inc_wage) + inc_wage_new,
-             affected = 1) %>%
-      select(-n_high)
-    
-    unsampled_high<-simulation_dataset %>%
-      filter(income_cat == "high") %>%
-      filter(!(unique_id %in% sampled_high$unique_id)) %>%
-      mutate(inc_wage_new = inc_wage,
-             inc_total_new = inc_total,
-             affected = 0)
-    
-    # Create the unsampled group, i.e., income category = "unassigned"
-    unsampled_na<-simulation_dataset %>%
-      filter(income_cat == "unassigned") %>%
-      mutate(inc_wage_new = inc_wage,
-             inc_total_new = inc_total,
-             affected = 0)
-    
-    # Bind rows of sampled/unsampled to perform necessary aggregations/calculations
-    final_sim<-bind_rows(sampled_low, unsampled_low, sampled_high, unsampled_high, unsampled_na)
-    
-    # Filter the simulation data to include only renter households, summarize primary variables, and calculate household level outcome variables
-    final_renters<-final_sim %>%
-      filter(OWNERSHP == 2) %>%
-      group_by(hhid) %>%
-      summarize(hh_income = mean(hh_income), 
-                rent_grs = mean(rent_grs),
-                rent_burden = mean(rent_burden, na.rm = T),
-                hh_affected = max(affected),
-                hh_income_new = if_else(hh_affected == 1, sum(inc_total_new, na.rm = T), hh_income)) %>%
-      mutate(rent_burden_new = if_else(rent_grs == 0, 0, pmin(rent_grs/(hh_income_new/12)*100, 200)),
-             burden_change = rent_burden_new - rent_burden,
-             support_needed = if_else(hh_affected == 1, pmax(0, round(rent_grs - ((rent_burden/100)*(hh_income_new/12)),5)), 0))
-    
-    # Calculate the additional support needed to return affected renters to their prior level of rent burden
-    affected_rental_support_row<-c("scenario" = scenario, "iteration" = i, 
-                                  "AvgHHSupport" = mean(filter(final_renters, hh_affected == 1)$support_needed), 
-                          "TotalHHSupport" = sum(filter(final_renters, hh_affected == 1)$support_needed))
-    
-    total_affected_rental_support<-bind_rows(total_affected_rental_support, affected_rental_support_row)
-    
-    # Calculate the change in rental burden for each household
-    max_change<-round(max(final_renters$burden_change))+1
-    
-    burden_change<-tibble()
-    
-    for (k in 1:max_change){
-      new_change_row<-c("scenario" = scenario, "iteration" = i, "burden_change" = k, 
-                        "cdf_count" = nrow(filter(final_renters, burden_change <= k)))
-      burden_change<-bind_rows(burden_change, new_change_row)
-    }
-    
-    total_burden_change<-bind_rows(total_burden_change, burden_change)
-    
-    # Calculate the distribution of rental burden
-    sim_dist<-tibble()
-    
-    for (j in 1:200){
-      new_row<-c("scenario" = scenario, "iteration" = i, "burden" = j, "count" = nrow(filter(final_renters, rent_burden_new <= j)))
-      sim_dist<-bind_rows(sim_dist, new_row)
-    }
-    
-    sim_cdf<-sim_dist %>%
-      mutate(pr_x = count/max(sim_dist$count))
-    
-    total_sim_cdf<-bind_rows(total_sim_cdf, sim_cdf)
-    
-    rm(final_sim, final_renters)
-  }
+  # Determine additional unemployment assistence based on scenario
+  add_UI<-if_else(s == 1, 0, if_else(s == 2, 400, if_else(s == 3, 800, if(s == 4) 1200)))
+  
+  # Create the sample groups for low income
+  sampled_low<-.ipums_data %>%
+    filter(income_cat == "low") %>%
+    group_by(UHERO_mnemonic) %>%
+    nest() %>%
+    filter(!is.na(UHERO_mnemonic)) %>%
+    ungroup() %>%
+    left_join(select(.job_loss_data, UHERO_mnemonic, n_low), by = "UHERO_mnemonic") %>%
+    mutate(samp = map2(data, n_low, sample_n)) %>%
+    select(-data) %>%
+    unnest(samp) %>%
+    mutate(inc_wage_new = pmin(inc_wage*0.60, 648*52) + add_UI*12,
+           inc_total_new = (inc_total - inc_wage) + inc_wage_new,
+           affected = 1) %>%
+    select(-n_low)
+  
+  unsampled_low<-.ipums_data %>%
+    filter(income_cat == "low") %>%
+    filter(!(unique_id %in% sampled_low$unique_id)) %>%
+    mutate(inc_wage_new = inc_total,
+           inc_total_new = inc_total,
+           affected = 0)
+  
+  # Create the sample groups for high income
+  sampled_high<-.ipums_data %>%
+    filter(income_cat == "high") %>%
+    group_by(UHERO_mnemonic) %>%
+    nest() %>%
+    filter(!is.na(UHERO_mnemonic)) %>%
+    ungroup() %>%
+    left_join(select(.job_loss_data, UHERO_mnemonic, n_high), by = "UHERO_mnemonic") %>%
+    mutate(samp = map2(data, n_high, sample_n)) %>%
+    select(-data) %>%
+    unnest(samp) %>%
+    mutate(inc_wage_new = pmin(inc_wage*0.60, 648*52) + add_UI*12,
+           inc_total_new = (inc_total - inc_wage) + inc_wage_new,
+           affected = 1) %>%
+    select(-n_high)
+  
+  unsampled_high<-.ipums_data %>%
+    filter(income_cat == "high") %>%
+    filter(!(unique_id %in% sampled_high$unique_id)) %>%
+    mutate(inc_wage_new = inc_wage,
+           inc_total_new = inc_total,
+           affected = 0)
+  
+  # Create the unsampled group
+  unsampled_na<-.ipums_data %>%
+    filter(income_cat == "unassigned") %>%
+    mutate(inc_wage_new = inc_wage,
+           inc_total_new = inc_total,
+           affected = 0)
+  
+  # Create the final data frame
+  final_sim<-bind_rows(sampled_low, unsampled_low, sampled_high, unsampled_high, unsampled_na) %>%
+    filter(OWNERSHP == 2) %>%
+    group_by(hhid) %>%
+    summarize(hh_income = mean(hh_income),
+              rent_grs = mean(rent_grs),
+              rent_burden = mean(rent_burden, na.rm = T),
+              hh_affected = max(affected),
+              hh_income_new = if_else(hh_affected == 1, sum(inc_total_new, na.rm = T), hh_income),
+              rent_burden_new = if_else(rent_grs == 0, 0, pmin(rent_grs/(hh_income_new/12)*100, 200)),
+              burden_change = rent_burden_new - rent_burden,
+              support_needed = if_else(hh_affected == 1, pmax(0, round(rent_grs - ((rent_burden/100)*(hh_income_new/12)),5)), 0))
+  
+  summary<-tibble(row_name = c("ui_paid", 
+                               "avg_hh_support", 
+                               "total_hh_support"),
+                  value = c(sum(final_sim$hh_affected)*add_UI, 
+                            mean(filter(final_sim, hh_affected == 1)$support_needed)*6,
+                            sum(filter(final_sim, hh_affected == 1)$support_needed)*6),
+                  rep = n_iter)
+  
+  rental_burden<-final_sim %>%
+    mutate(burden = if_else(rent_burden_new == 0, 1, ceiling(rent_burden_new))) %>%
+    group_by(burden) %>%
+    tally() %>%
+    mutate(row_name = paste0("burden_", burden),
+           rep = n_iter) %>%
+    select(row_name, "value" = n, rep)
+  
+  rental_burden_change<-final_sim %>%
+    mutate(rent_burden_change = if_else(burden_change <= 0, 1, ceiling(burden_change))) %>%
+    group_by(rent_burden_change) %>%
+    tally() %>%
+    mutate(row_name = paste0("change_", rent_burden_change),
+           rep = n_iter) %>%
+    select(row_name, "value" = n, rep)
+  
+  bind_rows(summary, rental_burden, rental_burden_change)
 }
-```
 
-    ## Progress:   1%  Progress:   2%  Progress:   3%  Progress:   4%  Progress:   5%  Progress:   6%  Progress:   7%  Progress:   8%  Progress:   9%  Progress:  10%  Progress:  11%  Progress:  12%  Progress:  13%  Progress:  14%  Progress:  15%  Progress:  16%  Progress:  17%  Progress:  18%  Progress:  19%  Progress:  20%  Progress:  21%  Progress:  22%  Progress:  23%  Progress:  24%  Progress:  25%  Progress:  26%  Progress:  27%  Progress:  28%  Progress:  29%  Progress:  30%  Progress:  31%  Progress:  32%  Progress:  33%  Progress:  34%  Progress:  35%  Progress:  36%  Progress:  37%  Progress:  38%  Progress:  39%  Progress:  40%  Progress:  41%  Progress:  42%  Progress:  43%  Progress:  44%  Progress:  45%  Progress:  46%  Progress:  47%  Progress:  48%  Progress:  49%  Progress:  50%  Progress:  51%  Progress:  52%  Progress:  53%  Progress:  54%  Progress:  55%  Progress:  56%  Progress:  57%  Progress:  58%  Progress:  59%  Progress:  60%  Progress:  61%  Progress:  62%  Progress:  63%  Progress:  64%  Progress:  65%  Progress:  66%  Progress:  67%  Progress:  68%  Progress:  69%  Progress:  70%  Progress:  71%  Progress:  72%  Progress:  73%  Progress:  74%  Progress:  75%  Progress:  76%  Progress:  77%  Progress:  78%  Progress:  79%  Progress:  80%  Progress:  81%  Progress:  82%  Progress:  83%  Progress:  84%  Progress:  85%  Progress:  86%  Progress:  87%  Progress:  88%  Progress:  89%  Progress:  90%  Progress:  91%  Progress:  92%  Progress:  93%  Progress:  94%  Progress:  95%  Progress:  96%  Progress:  97%  Progress:  98%  Progress:  99%  Progress: 100%  Progress:   1%  Progress:   2%  Progress:   3%  Progress:   4%  Progress:   5%  Progress:   6%  Progress:   7%  Progress:   8%  Progress:   9%  Progress:  10%  Progress:  11%  Progress:  12%  Progress:  13%  Progress:  14%  Progress:  15%  Progress:  16%  Progress:  17%  Progress:  18%  Progress:  19%  Progress:  20%  Progress:  21%  Progress:  22%  Progress:  23%  Progress:  24%  Progress:  25%  Progress:  26%  Progress:  27%  Progress:  28%  Progress:  29%  Progress:  30%  Progress:  31%  Progress:  32%  Progress:  33%  Progress:  34%  Progress:  35%  Progress:  36%  Progress:  37%  Progress:  38%  Progress:  39%  Progress:  40%  Progress:  41%  Progress:  42%  Progress:  43%  Progress:  44%  Progress:  45%  Progress:  46%  Progress:  47%  Progress:  48%  Progress:  49%  Progress:  50%  Progress:  51%  Progress:  52%  Progress:  53%  Progress:  54%  Progress:  55%  Progress:  56%  Progress:  57%  Progress:  58%  Progress:  59%  Progress:  60%  Progress:  61%  Progress:  62%  Progress:  63%  Progress:  64%  Progress:  65%  Progress:  66%  Progress:  67%  Progress:  68%  Progress:  69%  Progress:  70%  Progress:  71%  Progress:  72%  Progress:  73%  Progress:  74%  Progress:  75%  Progress:  76%  Progress:  77%  Progress:  78%  Progress:  79%  Progress:  80%  Progress:  81%  Progress:  82%  Progress:  83%  Progress:  84%  Progress:  85%  Progress:  86%  Progress:  87%  Progress:  88%  Progress:  89%  Progress:  90%  Progress:  91%  Progress:  92%  Progress:  93%  Progress:  94%  Progress:  95%  Progress:  96%  Progress:  97%  Progress:  98%  Progress:  99%  Progress: 100%  Progress:   1%  Progress:   2%  Progress:   3%  Progress:   4%  Progress:   5%  Progress:   6%  Progress:   7%  Progress:   8%  Progress:   9%  Progress:  10%  Progress:  11%  Progress:  12%  Progress:  13%  Progress:  14%  Progress:  15%  Progress:  16%  Progress:  17%  Progress:  18%  Progress:  19%  Progress:  20%  Progress:  21%  Progress:  22%  Progress:  23%  Progress:  24%  Progress:  25%  Progress:  26%  Progress:  27%  Progress:  28%  Progress:  29%  Progress:  30%  Progress:  31%  Progress:  32%  Progress:  33%  Progress:  34%  Progress:  35%  Progress:  36%  Progress:  37%  Progress:  38%  Progress:  39%  Progress:  40%  Progress:  41%  Progress:  42%  Progress:  43%  Progress:  44%  Progress:  45%  Progress:  46%  Progress:  47%  Progress:  48%  Progress:  49%  Progress:  50%  Progress:  51%  Progress:  52%  Progress:  53%  Progress:  54%  Progress:  55%  Progress:  56%  Progress:  57%  Progress:  58%  Progress:  59%  Progress:  60%  Progress:  61%  Progress:  62%  Progress:  63%  Progress:  64%  Progress:  65%  Progress:  66%  Progress:  67%  Progress:  68%  Progress:  69%  Progress:  70%  Progress:  71%  Progress:  72%  Progress:  73%  Progress:  74%  Progress:  75%  Progress:  76%  Progress:  77%  Progress:  78%  Progress:  79%  Progress:  80%  Progress:  81%  Progress:  82%  Progress:  83%  Progress:  84%  Progress:  85%  Progress:  86%  Progress:  87%  Progress:  88%  Progress:  89%  Progress:  90%  Progress:  91%  Progress:  92%  Progress:  93%  Progress:  94%  Progress:  95%  Progress:  96%  Progress:  97%  Progress:  98%  Progress:  99%  Progress: 100%  Progress:   1%  Progress:   2%  Progress:   3%  Progress:   4%  Progress:   5%  Progress:   6%  Progress:   7%  Progress:   8%  Progress:   9%  Progress:  10%  Progress:  11%  Progress:  12%  Progress:  13%  Progress:  14%  Progress:  15%  Progress:  16%  Progress:  17%  Progress:  18%  Progress:  19%  Progress:  20%  Progress:  21%  Progress:  22%  Progress:  23%  Progress:  24%  Progress:  25%  Progress:  26%  Progress:  27%  Progress:  28%  Progress:  29%  Progress:  30%  Progress:  31%  Progress:  32%  Progress:  33%  Progress:  34%  Progress:  35%  Progress:  36%  Progress:  37%  Progress:  38%  Progress:  39%  Progress:  40%  Progress:  41%  Progress:  42%  Progress:  43%  Progress:  44%  Progress:  45%  Progress:  46%  Progress:  47%  Progress:  48%  Progress:  49%  Progress:  50%  Progress:  51%  Progress:  52%  Progress:  53%  Progress:  54%  Progress:  55%  Progress:  56%  Progress:  57%  Progress:  58%  Progress:  59%  Progress:  60%  Progress:  61%  Progress:  62%  Progress:  63%  Progress:  64%  Progress:  65%  Progress:  66%  Progress:  67%  Progress:  68%  Progress:  69%  Progress:  70%  Progress:  71%  Progress:  72%  Progress:  73%  Progress:  74%  Progress:  75%  Progress:  76%  Progress:  77%  Progress:  78%  Progress:  79%  Progress:  80%  Progress:  81%  Progress:  82%  Progress:  83%  Progress:  84%  Progress:  85%  Progress:  86%  Progress:  87%  Progress:  88%  Progress:  89%  Progress:  90%  Progress:  91%  Progress:  92%  Progress:  93%  Progress:  94%  Progress:  95%  Progress:  96%  Progress:  97%  Progress:  98%  Progress:  99%  Progress: 100%
+# Repeat each scenario 100 times and output results
+scenario_output<-list(
+  scenario1 = seq_len(n_iterations) %>%
+    future_map_dfr(.f = simulation_scenario,
+                   s = 1,
+                   .job_loss_data = n_jobs,
+                   .ipums_data = simulation_dataset),
+  
+  scenario2 = seq_len(n_iterations) %>%
+    future_map_dfr(.f = simulation_scenario,
+                   s = 2,
+                   .job_loss_data = n_jobs,
+                   .ipums_data = simulation_dataset),
+  
+  scenario3 = seq_len(n_iterations) %>%
+    future_map_dfr(.f = simulation_scenario,
+                   s = 3,
+                   .job_loss_data = n_jobs,
+                   .ipums_data = simulation_dataset),
+  
+  scenario4 = seq_len(n_iterations) %>%
+    future_map_dfr(.f = simulation_scenario,
+                   s = 4,
+                   .job_loss_data = n_jobs,
+                   .ipums_data = simulation_dataset))
+```
 
 ## Results
 
@@ -347,14 +344,24 @@ below:
 
 ``` r
 # Calculate the average 6 month needed support for affected households
-total_renter_support<-total_affected_rental_support %>%
-  group_by(scenario) %>%
-  summarize("Individual Household Support" = mean(AvgHHSupport*6),
-            "Total Support" = mean(TotalHHSupport*6)) %>%
+summary_output<-bind_rows(lapply(scenario_output, 
+                                 function(x) filter(x, row_name %in% c("ui_paid", 
+                                                                       "avg_hh_support", 
+                                                                       "total_hh_support"))), 
+                          .id = "Scenario") %>%
+  spread(key = row_name, value = value) %>%
+  group_by(Scenario) %>%
+  summarize_at(.vars = vars(-rep), .funs = mean)
+
+total_renter_support<-summary_output %>%
   gt() %>%
-  fmt_number(columns = vars("Individual Household Support", "Total Support"), decimal = 0) %>%
+  fmt_number(columns = vars(avg_hh_support, total_hh_support, ui_paid), decimal = 0) %>%
+  cols_label(Scenario = "Scenario",
+             avg_hh_support = "Individual Household Support Needed",
+             total_hh_support = "Total Support Needed",
+             ui_paid = "Total Additional UI Paid to Renter Households") %>%
   tab_header(title = "Support Needed for Renter Households who Suffered a Job Loss",
-             subtitle = "Mean of 100 simulations")
+             subtitle = "Mean of 100")
 
 gtsave(total_renter_support, filename = "total_renter_support.png")
 ```
@@ -365,46 +372,43 @@ gtsave(total_renter_support, filename = "total_renter_support.png")
 
 ``` r
 ### Plot the PDF of the change in rental burden
-burden_change_pdf<-total_burden_change %>%
-  group_by(scenario, burden_change) %>%
-  summarize(avg_burden_change = mean(cdf_count)) %>%
-  mutate(pdf_count = case_when(burden_change == 1 ~ avg_burden_change, 
-                               burden_change > 1 ~ avg_burden_change - lag(avg_burden_change))) %>%
-  select(scenario, burden_change, pdf_count) 
-
-burden_change_pdf %>%
-    filter(burden_change > 1) %>%
-    ggplot() +
-    geom_line(aes(x = burden_change, y = pdf_count), color = "blue4") +
-    facet_wrap(~ scenario, scales = "free") +
-    scale_y_continuous(labels=function(x) format(x, big.mark = ",", decimal.mark = ".", scientific = FALSE)) +
-    theme_minimal() +
-    ggtitle("Percent Change in Rent Burden Household Count", subtitle = "Excludes rent burden change < 1%") +
-    xlab("Rent Burden Change") +
-    ylab("Number of Households")
+change_output<-bind_rows(lapply(scenario_output, 
+                                function(x) filter(x, str_starts(row_name, "change_"))),
+                         .id = "Scenario") %>%
+  separate(col = row_name, into = c("drop", "change"), sep = "_", remove = T) %>%
+  select(-drop) %>%
+  group_by(Scenario, change) %>%
+  summarize(num_hh = mean(value)) %>%
+  mutate_at(.vars = vars(change), .funs = as.double) %>%
+  arrange(Scenario, change)
+  
+change_output %>%
+  filter(change > 1) %>%
+  ggplot() +
+  geom_line(aes(x = change, y = num_hh), color = "blue4") +
+  facet_wrap(~ Scenario, scales = "free") +
+  scale_y_continuous(labels=function(x) format(x, big.mark = ",", decimal.mark = ".", scientific = FALSE)) +
+  theme_minimal() +
+  ggtitle("Percent Change in Rent Burden Household Count", subtitle = "Excludes rent burden change < 1%") +
+  xlab("Rent Burden Change") +
+  ylab("Number of Households")
 ```
 
 ![](README_files/figure-gfm/results-burden-change-1.png)<!-- -->
 
 ``` r
-total_bucket_change<-total_burden_change %>%
-  group_by(scenario) %>%
-  mutate(bucket_labels = cut(burden_change, 
-                             breaks = c(0, 1, seq(from = 10, to = max(burden_change), by = 10), max(burden_change)))) %>%
-  filter(burden_change %in% c(0, 1, seq(from = 10, to = max(burden_change), by = 10), max(burden_change))) %>%
-  mutate(burden_bucket_count = if_else(burden_change == 1, cdf_count, cdf_count - lag(cdf_count))) %>%
-  group_by(scenario, bucket_labels) %>%
-  summarize(burden_change = mean(burden_change),
-            avg_bucket_count = mean(burden_bucket_count)) %>%
-  arrange(scenario, burden_change)
+bucket_change<-change_output %>%
+  mutate(bucket_labels = cut(change, 
+                             breaks = c(0, 1, seq(from = 10, to = max(change), by = 10), 
+                                        max(change)), include.lowest = T)) %>%
+  group_by(Scenario, bucket_labels) %>%
+  summarize(bucket_count = sum(num_hh))
 
-total_bucket_change$bucket_labels<-factor(total_bucket_change$bucket_labels, levels = unique(total_bucket_change$bucket_labels))
-
-total_bucket_change %>%
-  filter(burden_change != 1) %>%
+bucket_change %>%
+  filter(bucket_labels != "[0,1]") %>%
   ggplot() +
-  geom_col(aes(x = bucket_labels, y = avg_bucket_count), fill = "blue4", alpha = 0.7) +
-  facet_wrap(~ scenario, scales = "free") +
+  geom_col(aes(x = bucket_labels, y = bucket_count), fill = "blue4", alpha = 0.7) +
+  facet_wrap(~ Scenario, scales = "free") +
   scale_y_continuous(labels=function(x) format(x, big.mark = ",", decimal.mark = ".", scientific = FALSE)) +
   ggtitle("Number of Households by Rental Burden Change Bucket") +
   xlab("Rental Burden Change") +
@@ -416,12 +420,11 @@ total_bucket_change %>%
 ![](README_files/figure-gfm/results-burden-change-2.png)<!-- -->
 
 ``` r
-rental_bucket_change<-total_bucket_change %>%
-  select(-burden_change) %>%
+rental_bucket_change<-bucket_change %>%
   gt() %>%
-  cols_label(bucket_labels = "Rental Burden Group",
-             avg_bucket_count = "Number of Households") %>%
-  fmt_number(columns = vars(avg_bucket_count), decimal = 0)
+  cols_label(bucket_labels = "Rental Burden Change",
+             bucket_count = "Number of Households") %>%
+  fmt_number(columns = vars(bucket_count), decimal = 0)
 
 gtsave(rental_bucket_change, filename = "rental_bucket_change.png")
 ```
@@ -444,26 +447,28 @@ initial_pdf<-ipums_rental_hhcollapse %>%
   mutate(burden = if_else(rent_burden == 0, 1, ceiling(rent_burden))) %>%
   group_by(burden) %>%
   summarize(initial_pdf_count = n())
-  
-# Calculate the pdf of rental burden for each scenario
-sim_pdf<-total_sim_cdf %>%
-  group_by(scenario, burden) %>%
-  summarize(avg_sim_count = mean(count)) %>%
-  mutate(sim_pdf_count = case_when(burden == 1 ~ avg_sim_count,
-                                   burden > 1 ~ avg_sim_count - lag(avg_sim_count))) %>%
-  select(scenario, burden, sim_pdf_count)
-  
-# Join the pre and post job loss pdfs of rental burden
-joined_pdf<-inner_join(sim_pdf, initial_pdf, by = "burden") %>%
-  pivot_longer(cols = c("sim_pdf_count", "initial_pdf_count"), names_to = "key", values_to = "value") %>%
-  filter(burden != 1)
-  
-ggplot(data = joined_pdf, aes(x = burden, y = value, group = key, color = key)) +
+
+# Simulated pdf
+burden_output<-bind_rows(lapply(scenario_output, 
+                                function(x) filter(x, str_starts(row_name, "burden_"))),
+                         .id = "Scenario") %>%
+  separate(col = row_name, into = c("drop", "burden"), sep = "_", remove = T) %>%
+  select(-drop) %>%
+  group_by(Scenario, burden) %>%
+  summarize(num_hh = mean(value)) %>%
+  mutate_at(.vars = vars(burden), .funs = as.double) %>%
+  arrange(Scenario, burden)
+
+# Join the simulated and initial pdf and plot the burden
+inner_join(burden_output, initial_pdf, by = "burden") %>%
+  pivot_longer(cols = c("num_hh", "initial_pdf_count"), names_to = "key", values_to = "value") %>%
+  filter(burden != 1) %>%
+  ggplot(aes(x = burden, y = value, group = key, color = key)) +
   geom_line(alpha = 0.5) +
   geom_smooth(se = F) +
-  facet_wrap(~ scenario, scales = "free") +
+  facet_wrap(~ Scenario, scales = "free") +
   scale_y_continuous(labels=function(x) format(x, big.mark = ",", decimal.mark = ".", scientific = FALSE)) +
-  scale_color_manual(values = c("indianred", "blue4"), labels = c("Initial Count", "Avg Simulation Count")) +
+  scale_color_manual(values = c(alpha("indianred", 0.7), alpha("blue4", 0.7)), labels = c("Initial Count", "Avg Simulation Count")) +
   theme_minimal() +
   ggtitle("PDF of Rental Burden", subtitle = "Excludes rental burden < 1%") +
   xlab("Rental Burden") +
@@ -480,30 +485,28 @@ rental burden: 1. Safe \[0, 30\] 2. At Risk (30, 50\] 3. Support Needed
 (50, 70\] 4. In Crisis (70, 200+)
 
 ``` r
-# Order of risk bins
 order<-c("[0,30]", "(30, 50]", "(50, 70]", "(70, 200+)")
 
-sim_risk_bins<-sim_pdf %>%
-  group_by(scenario) %>%
-  mutate(bin_label = cut(burden, breaks = c(0, 30, 50, 70, 200), include.lowest = T, labels = order)) %>%
-  group_by(scenario, bin_label) %>%
-  summarize(sim_bin_count = sum(sim_pdf_count))
+sim_risk_bins<-burden_output %>%
+  group_by(Scenario) %>%
+  mutate(risk_bins = cut(burden, breaks = c(0, 30, 50, 70, 200), include.lowest = T, labels = order)) %>%
+  group_by(Scenario, risk_bins) %>%
+  summarize(sim_bin_count = sum(num_hh))
 
 initial_risk_bins<-ipums_rental_hhcollapse %>%
-  mutate(bin_label = cut(rent_burden, breaks = c(0, 30, 50, 70, 200), include.lowest = T, labels = order)) %>%
-  group_by(bin_label) %>%
+  mutate(risk_bins = cut(rent_burden, breaks = c(0, 30, 50, 70, 200), include.lowest = T, labels = order)) %>%
+  group_by(risk_bins) %>%
   summarize(initial_bin_count = n())
 
-bin_join<-inner_join(initial_risk_bins, sim_risk_bins, by = "bin_label")
-
+bin_join<-inner_join(sim_risk_bins, initial_risk_bins, by = "risk_bins")
 
 bin_join %>%
   gather(key = "key", value = "bin_counts", initial_bin_count, sim_bin_count) %>%
   group_by(key) %>%
   ggplot() +
-  geom_col(aes(x = bin_label, y = bin_counts, group = key, fill = key), position = "dodge") +
+  geom_col(aes(x = risk_bins, y = bin_counts, group = key, fill = key), position = "dodge") +
   scale_y_continuous(labels=function(x) format(x, big.mark = ",", decimal.mark = ".", scientific = FALSE)) +
-  facet_wrap(~ scenario, scales = "free") +
+  facet_wrap(~ Scenario, scales = "free") +
   theme_minimal() +
   ggtitle("Number of Households in Each Rent Burden Risk Category") +
   xlab("") +
@@ -516,11 +519,10 @@ bin_join %>%
 
 ``` r
 risk_bin_count<-bin_join %>%
-  mutate(scenario_chr = paste0("scenario", scenario)) %>%
-  select(scenario_chr, bin_label, initial_bin_count, sim_bin_count) %>% 
-  spread(key = scenario_chr, value = sim_bin_count) %>%
+  select(Scenario, risk_bins, initial_bin_count, sim_bin_count) %>% 
+  spread(key = Scenario, value = sim_bin_count) %>%
   gt() %>%
-  cols_label(bin_label = "Risk Bin",
+  cols_label(risk_bins = "Risk Bin",
              initial_bin_count = "Initial Household Count", 
              scenario1 = "Scenario 1",
              scenario2 = "Scenario 2",
